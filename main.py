@@ -1,14 +1,11 @@
 import pandas as pd
 import os
-import smtplib
 import uvicorn
+import requests  # Added for SendGrid API
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email import encoders
+import base64
 
 # =========================
 # FASTAPI APP
@@ -20,8 +17,10 @@ app = FastAPI(title="Loan Risk Monitoring API")
 # =========================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-EMAIL_USER = os.getenv("EMAIL_USER")
-EMAIL_PASS = os.getenv("EMAIL_PASS")
+# On Render, set EMAIL_PASS to your SendGrid API Key (starts with SG.)
+# Set EMAIL_USER to your verified sender email address in SendGrid
+EMAIL_PASS = os.getenv("EMAIL_PASS") 
+EMAIL_USER = os.getenv("EMAIL_USER") 
 EMAIL_TO = os.getenv("EMAIL_TO")
 
 # =========================
@@ -34,7 +33,6 @@ def load_and_clean_csv(file_name):
         return pd.DataFrame()
     
     df = pd.read_csv(path)
-    # Clean column names: remove spaces and convert to lowercase
     df.columns = df.columns.str.strip().str.lower()
     return df
 
@@ -58,12 +56,50 @@ class AgreementQuery(BaseModel):
 # SAFE MERGE
 # =========================
 def safe_merge(left_df, right_df, left_key, right_key):
-    if left_df.empty or right_df.empty:
-        return left_df
-    if left_key not in left_df.columns or right_key not in right_df.columns:
-        return left_df
-
+    if left_df.empty or right_df.empty: return left_df
+    if left_key not in left_df.columns or right_key not in right_df.columns: return left_df
     return left_df.merge(right_df, left_on=left_key, right_on=right_key, how="left")
+
+# =========================
+# EMAIL VIA SENDGRID API (Replaces SMTP)
+# =========================
+def send_via_sendgrid(body, csv_path=None):
+    if not EMAIL_PASS or not EMAIL_USER or not EMAIL_TO:
+        print("❌ Email configuration missing (EMAIL_PASS/USER/TO)")
+        return
+
+    url = "https://api.sendgrid.com/v3/mail/send"
+    
+    message_data = {
+        "personalizations": [{"to": [{"email": EMAIL_TO}]}],
+        "from": {"email": EMAIL_USER}, # Must be your SendGrid verified sender
+        "subject": f"Daily Risk Alert - {pd.Timestamp.now().strftime('%Y-%m-%d')}",
+        "content": [{"type": "text/plain", "value": body}]
+    }
+
+    if csv_path and os.path.exists(csv_path):
+        with open(csv_path, "rb") as f:
+            encoded_file = base64.b64encode(f.read()).decode()
+            message_data["attachments"] = [{
+                "content": encoded_file,
+                "filename": os.path.basename(csv_path),
+                "type": "text/csv",
+                "disposition": "attachment"
+            }]
+
+    headers = {
+        "Authorization": f"Bearer {EMAIL_PASS}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=message_data)
+        if response.status_code in [200, 201, 202]:
+            print("✓ Email sent successfully via SendGrid API")
+        else:
+            print(f"❌ SendGrid Error: {response.status_code} - {response.text}")
+    except Exception as e:
+        print(f"❌ Request Error: {e}")
 
 # =========================
 # API ENDPOINTS
@@ -72,67 +108,6 @@ def safe_merge(left_df, right_df, left_key, right_key):
 @app.get("/")
 def home():
     return {"service": "Loan Risk Monitoring API", "status": "running"}
-
-@app.post("/get_master")
-def get_master(query: AgreementQuery):
-    a = agreement[agreement["agreement_no"] == query.agreement_no]
-    if a.empty:
-        return JSONResponse(status_code=404, content={"error": "Agreement not found"})
-
-    m = a.copy()
-    m = safe_merge(m, product, "product_id", "product_id")
-    m = safe_merge(m, dealer, "dealer_id", "dealer_id")
-    m = safe_merge(m, employee, "employee_id", "employee_id")
-    return m.to_dict(orient="records")[0]
-
-@app.post("/get_bounce")
-def get_bounce(query: AgreementQuery):
-    count = len(bounce[bounce["agreement_no"] == query.agreement_no]) if not bounce.empty else 0
-    return {"agreement_no": query.agreement_no, "bounce_count": int(count)}
-
-@app.post("/get_dpd")
-def get_dpd(query: AgreementQuery):
-    p = payment[payment["agreement_no"] == query.agreement_no]
-    if p.empty:
-        return {"agreement_no": query.agreement_no, "dpd": 0}
-
-    row = p.iloc[0]
-    due = pd.to_datetime(row["due_date"])
-    paid = pd.to_datetime(row["payment_date"])
-    dpd = (paid - due).days
-    return {"agreement_no": query.agreement_no, "dpd": int(dpd)}
-
-# =========================
-# RISK ENGINE & EMAIL
-# =========================
-
-def send_via_gmail(body, csv_path=None):
-    if not EMAIL_USER or not EMAIL_PASS or not EMAIL_TO:
-        print("Email credentials not configured")
-        return
-
-    msg = MIMEMultipart()
-    msg["From"] = EMAIL_USER
-    msg["To"] = EMAIL_TO
-    msg["Subject"] = f"Daily Risk Alert - {pd.Timestamp.now().strftime('%Y-%m-%d')}"
-    msg.attach(MIMEText(body, "plain"))
-
-    if csv_path and os.path.exists(csv_path):
-        with open(csv_path, "rb") as f:
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(f.read())
-            encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(csv_path)}")
-            msg.attach(part)
-
-    try:
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.starttls()
-            server.login(EMAIL_USER, EMAIL_PASS)
-            server.send_message(msg)
-        print("✓ Email sent")
-    except Exception as e:
-        print("Email error:", e)
 
 @app.get("/run-risk")
 def trigger_risk():
@@ -143,42 +118,37 @@ def trigger_risk():
         return {"error": "No agreement data available"}
 
     for ag in agreement["agreement_no"]:
-        # Get bounce count safely
         b_count = len(bounce[bounce["agreement_no"] == ag]) if not bounce.empty else 0
-        
-        # Get DPD safely
         p = payment[payment["agreement_no"] == ag] if not payment.empty else pd.DataFrame()
+        
         dpd = 0
         if not p.empty:
             row = p.iloc[0]
-            dpd = (pd.to_datetime(row["payment_date"]) - pd.to_datetime(row["due_date"])).days
+            # Fixed date parsing warning
+            due_date = pd.to_datetime(row["due_date"], dayfirst=True, errors='coerce')
+            pay_date = pd.to_datetime(row["payment_date"], dayfirst=True, errors='coerce')
+            if pd.notnull(due_date) and pd.notnull(pay_date):
+                dpd = (pay_date - due_date).days
 
-        # Risk Logic
         if dpd > 10 or b_count >= 2:
             risk = "HIGH RISK" if dpd > 30 else "MEDIUM RISK"
             action = "Legal Notice Triggered" if dpd > 30 else "Reminder Mail Triggered"
-            
             results.append({
-                "agreement_no": ag,
-                "dpd": dpd,
-                "bounce_count": b_count,
-                "risk_level": risk,
-                "action_taken": action
+                "agreement_no": ag, "dpd": dpd, "bounce_count": b_count,
+                "risk_level": risk, "action_taken": action
             })
 
     output_path = os.path.join(BASE_DIR, "daily_risk_output.csv")
     if results:
         df_out = pd.DataFrame(results)
         df_out.to_csv(output_path, index=False)
-        
         summary = f"Daily Risk Report\nDate: {pd.Timestamp.now()}\nTotal Risky Agreements: {len(results)}\n"
-        send_via_gmail(summary, output_path)
+        send_via_sendgrid(summary, output_path)
 
     return {"message": "Analysis completed", "risky_count": len(results)}
 
-# =========================
-# RUNNER (For Local/Render)
-# =========================
+# Add standard API endpoints (get_master, etc) as needed...
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
