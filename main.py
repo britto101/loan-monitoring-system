@@ -9,6 +9,11 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 
+# NEW IMPORTS FOR AUTOMATION
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from pytz import timezone
+
 # =========================
 # FASTAPI APP
 # =========================
@@ -36,14 +41,11 @@ employee = pd.read_csv(os.path.join(BASE_DIR, "employee_details.csv"))
 bounce = pd.read_csv(os.path.join(BASE_DIR, "bounce_details.csv"))
 payment = pd.read_csv(os.path.join(BASE_DIR, "payment_details.csv"))
 
-# Normalize column names (VERY IMPORTANT FIX)
+# Normalize column names
 for df in [agreement, product, dealer, employee, bounce, payment]:
     df.columns = df.columns.str.lower().str.strip()
 
 print("✓ CSV files loaded")
-print("Agreement columns:", agreement.columns)
-print("Bounce columns:", bounce.columns)
-print("Payment columns:", payment.columns)
 
 # =========================
 # REQUEST MODEL
@@ -75,9 +77,6 @@ def safe_merge(left_df, right_df, left_key, right_key):
 @app.post("/get_master")
 def get_master(query: AgreementQuery):
 
-    if "agreement_no" not in agreement.columns:
-        return {"error": "agreement_no column missing in agreement_details"}
-
     a = agreement[agreement["agreement_no"] == query.agreement_no]
 
     if a.empty:
@@ -101,9 +100,6 @@ def get_master(query: AgreementQuery):
 @app.post("/get_bounce")
 def get_bounce(query: AgreementQuery):
 
-    if "agreement_no" not in bounce.columns:
-        return {"error": "agreement_no column missing in bounce_details"}
-
     count = len(bounce[bounce["agreement_no"] == query.agreement_no])
 
     return {
@@ -117,9 +113,6 @@ def get_bounce(query: AgreementQuery):
 
 @app.post("/get_dpd")
 def get_dpd(query: AgreementQuery):
-
-    if "agreement_no" not in payment.columns:
-        return {"error": "agreement_no column missing in payment_details"}
 
     p = payment[payment["agreement_no"] == query.agreement_no]
 
@@ -186,7 +179,6 @@ def send_via_gmail(body, csv_path=None):
         print("✓ Email sent")
 
     except Exception as e:
-
         print("Email error:", e)
 
 # =========================
@@ -199,29 +191,22 @@ def run_risk_analysis():
 
     results = []
 
-    if "agreement_no" not in agreement.columns:
-        return {"error": "agreement_no column missing in agreement_details"}
-
     for ag in agreement["agreement_no"]:
 
-        bounce_count = 0
+        bounce_count = len(bounce[bounce["agreement_no"] == ag])
+
+        p = payment[payment["agreement_no"] == ag]
+
         dpd = 0
 
-        if "agreement_no" in bounce.columns:
-            bounce_count = len(bounce[bounce["agreement_no"] == ag])
+        if not p.empty:
 
-        if "agreement_no" in payment.columns:
+            row = p.iloc[0]
 
-            p = payment[payment["agreement_no"] == ag]
+            due = pd.to_datetime(row["due_date"])
+            paid = pd.to_datetime(row["payment_date"])
 
-            if not p.empty:
-
-                row = p.iloc[0]
-
-                due = pd.to_datetime(row["due_date"])
-                paid = pd.to_datetime(row["payment_date"])
-
-                dpd = (paid - due).days
+            dpd = (paid - due).days
 
         if dpd > 10 or bounce_count >= 2:
 
@@ -240,14 +225,11 @@ def run_risk_analysis():
                 "Action": action
             })
 
-    print("Risky agreements:", len(results))
-
     output_path = os.path.join(BASE_DIR, "daily_risk_output.csv")
 
     if results:
 
         df = pd.DataFrame(results)
-
         df.to_csv(output_path, index=False)
 
         body = f"""Daily Risk Report
@@ -257,34 +239,45 @@ Date: {pd.Timestamp.now()}
 Total Risky Agreements: {len(results)}
 """
 
-        for r in results:
-
-            body += f"""
-Agreement No: {r['agreement_no']}
-DPD: {r['DPD']}
-Bounce Count: {r['Bounce']}
-Risk Level: {r['Risk']}
-Action: {r['Action']}
-"""
-
         send_via_gmail(body, output_path)
 
-    return {
-        "risky_agreements": len(results)
-    }
+    return len(results)
 
 # =========================
-# API TO RUN RISK ENGINE
+# AUTOMATION SCHEDULER
+# =========================
+
+scheduler = BackgroundScheduler()
+ist = timezone("Asia/Kolkata")
+
+scheduler.add_job(
+    run_risk_analysis,
+    CronTrigger(hour=10, minute=0, timezone=ist),  # Runs daily 10 AM IST
+    id="daily_risk_job",
+    replace_existing=True
+)
+
+@app.on_event("startup")
+def start_scheduler():
+    scheduler.start()
+    print("✓ Scheduler started - runs daily at 10:00 AM IST")
+
+@app.on_event("shutdown")
+def stop_scheduler():
+    scheduler.shutdown()
+
+# =========================
+# MANUAL TRIGGER API
 # =========================
 
 @app.get("/run-risk")
 def trigger_risk():
 
-    result = run_risk_analysis()
+    count = run_risk_analysis()
 
     return {
         "message": "Risk analysis completed",
-        "result": result
+        "risky_agreements": count
     }
 
 # =========================
