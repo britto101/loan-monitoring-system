@@ -1,12 +1,14 @@
 import pandas as pd
 import os
-import base64
+import smtplib
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
 from apscheduler.schedulers.background import BackgroundScheduler
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail, Attachment
 
 # =========================
 # FASTAPI APP
@@ -20,9 +22,9 @@ app = FastAPI(title="Loan Risk Monitoring API")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASS = os.getenv("EMAIL_PASS")
 EMAIL_TO = os.getenv("EMAIL_TO")
-EMAIL_FROM = os.getenv("EMAIL_FROM")
 
 # =========================
 # SAFE CSV LOADER
@@ -94,6 +96,7 @@ def home():
 
 @app.get("/health")
 def health():
+
     return {"status": "ok"}
 
 # =========================
@@ -170,46 +173,51 @@ def get_dpd(query: AgreementQuery):
     }
 
 # =========================
-# EMAIL FUNCTION (SENDGRID)
+# EMAIL FUNCTION
 # =========================
 
-def send_email(body, csv_path=None):
+def send_via_gmail(body, csv_path=None):
 
-    if not SENDGRID_API_KEY:
-        print("SendGrid API key not configured")
+    if not EMAIL_USER or not EMAIL_PASS or not EMAIL_TO:
+        print("Email credentials not configured")
         return
+
+    msg = MIMEMultipart()
+
+    msg["From"] = EMAIL_USER
+    msg["To"] = EMAIL_TO
+    msg["Subject"] = "Daily Risk Alert"
+
+    msg.attach(MIMEText(body, "plain"))
+
+    if csv_path and os.path.exists(csv_path):
+
+        with open(csv_path, "rb") as f:
+
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(f.read())
+
+            encoders.encode_base64(part)
+
+            part.add_header(
+                "Content-Disposition",
+                f"attachment; filename={os.path.basename(csv_path)}"
+            )
+
+            msg.attach(part)
 
     try:
 
-        message = Mail(
-            from_email=EMAIL_FROM,
-            to_emails=EMAIL_TO,
-            subject="Daily Risk Alert",
-            plain_text_content=body
-        )
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
 
-        if csv_path and os.path.exists(csv_path):
+            server.starttls()
+            server.login(EMAIL_USER, EMAIL_PASS)
+            server.send_message(msg)
 
-            with open(csv_path, "rb") as f:
-                data = f.read()
-
-            encoded = base64.b64encode(data).decode()
-
-            attachment = Attachment(
-                file_content=encoded,
-                file_name="daily_risk_output.csv",
-                file_type="text/csv",
-                disposition="attachment"
-            )
-
-            message.attachment = attachment
-
-        sg = SendGridAPIClient(SENDGRID_API_KEY)
-        sg.send(message)
-
-        print("Email sent successfully")
+        print("Email sent")
 
     except Exception as e:
+
         print("Email error:", e)
 
 # =========================
@@ -278,7 +286,7 @@ Date: {pd.Timestamp.now()}
 Total Risky Agreements: {len(results)}
 """
 
-        send_email(body, output_path)
+        send_via_gmail(body, output_path)
 
     return {"risky_agreements": len(results)}
 
@@ -313,4 +321,4 @@ scheduler.add_job(
     minute=50
 )
 
-scheduler.start()
+scheduler.start() 
