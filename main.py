@@ -4,26 +4,87 @@ from fastapi import FastAPI
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from pytz import timezone
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition
+import base64
 
 app = FastAPI()
 
-# Base directory
+# -----------------------------
+# Environment Variables
+# -----------------------------
+
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+EMAIL_FROM = os.getenv("EMAIL_USER")
+EMAIL_TO = os.getenv("EMAIL_TO")
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Load Data
-agreement = pd.read_csv("agreement.csv")
-bounce = pd.read_csv("bounce.csv")
-payment = pd.read_csv("payment.csv")
+# -----------------------------
+# Load CSV Files
+# -----------------------------
 
-# Dummy email function
-def send_via_sendgrid(summary, file):
-    print("Email sent with report:", file)
+def load_data():
+    try:
+        agreement = pd.read_csv("agreement.csv")
+    except:
+        agreement = pd.DataFrame()
+
+    try:
+        bounce = pd.read_csv("bounce.csv")
+    except:
+        bounce = pd.DataFrame()
+
+    try:
+        payment = pd.read_csv("payment.csv")
+    except:
+        payment = pd.DataFrame()
+
+    return agreement, bounce, payment
 
 
-# --- RISK ANALYSIS FUNCTION ---
+# -----------------------------
+# Send Email using SendGrid
+# -----------------------------
+
+def send_via_sendgrid(summary, file_path):
+
+    with open(file_path, "rb") as f:
+        data = f.read()
+
+    encoded = base64.b64encode(data).decode()
+
+    attachment = Attachment(
+        FileContent(encoded),
+        FileName("daily_risk_report.csv"),
+        FileType("text/csv"),
+        Disposition("attachment")
+    )
+
+    message = Mail(
+        from_email=EMAIL_FROM,
+        to_emails=EMAIL_TO,
+        subject="Daily Risk Analysis Report",
+        plain_text_content=summary
+    )
+
+    message.attachment = attachment
+
+    sg = SendGridAPIClient(SENDGRID_API_KEY)
+    sg.send(message)
+
+    print("Email sent successfully")
+
+
+# -----------------------------
+# Risk Analysis Logic
+# -----------------------------
+
 def run_risk_analysis():
 
     print(f"\n[{pd.Timestamp.now()}] Starting Risk Analysis...")
+
+    agreement, bounce, payment = load_data()
 
     results = []
 
@@ -43,8 +104,8 @@ def run_risk_analysis():
 
             row = p.iloc[0]
 
-            due_date = pd.to_datetime(row["due_date"], dayfirst=True, errors='coerce')
-            pay_date = pd.to_datetime(row["payment_date"], dayfirst=True, errors='coerce')
+            due_date = pd.to_datetime(row["due_date"], errors="coerce")
+            pay_date = pd.to_datetime(row["payment_date"], errors="coerce")
 
             if pd.notnull(due_date) and pd.notnull(pay_date):
                 dpd = (pay_date - due_date).days
@@ -64,33 +125,34 @@ def run_risk_analysis():
 
     if results:
 
-        output_path = os.path.join(BASE_DIR, "daily_risk_output.csv")
+        output_file = os.path.join(BASE_DIR, "daily_risk_output.csv")
 
-        df_out = pd.DataFrame(results)
-
-        df_out.to_csv(output_path, index=False)
+        df = pd.DataFrame(results)
+        df.to_csv(output_file, index=False)
 
         summary = f"""
 Daily Risk Report
+
 Date: {pd.Timestamp.now()}
+
 Total Risky Agreements: {len(results)}
 """
 
-        send_via_sendgrid(summary, output_path)
+        send_via_sendgrid(summary, output_file)
 
-        print("Report generated.")
+        print(f"Report sent for {len(results)} risky agreements")
 
     else:
-        print("No risky agreements found.")
+        print("No risky agreements found")
 
     return len(results)
 
 
-# --- SCHEDULER ---
+# -----------------------------
+# Scheduler Setup
+# -----------------------------
 
-ist_tz = timezone("Asia/Kolkata")
-
-scheduler = BackgroundScheduler(timezone=ist_tz)
+scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
 
 scheduler.add_job(
     run_risk_analysis,
@@ -99,28 +161,33 @@ scheduler.add_job(
     replace_existing=True
 )
 
+# -----------------------------
+# FastAPI Lifecycle
+# -----------------------------
 
 @app.on_event("startup")
-def startup():
-
+def start_scheduler():
     scheduler.start()
-
-    print("Scheduler started. Running daily at 10:00 AM IST.")
+    print("Scheduler started → Mail will trigger daily at 10 AM IST")
 
 
 @app.on_event("shutdown")
-def shutdown():
-
+def shutdown_scheduler():
     scheduler.shutdown()
 
 
-# --- MANUAL ENDPOINT ---
+# -----------------------------
+# API Endpoints
+# -----------------------------
+
+@app.get("/")
+def home():
+    return {"message": "Risk Automation Server Running"}
+
 
 @app.get("/run-risk")
-def trigger_risk():
-
+def trigger_risk_manually():
     count = run_risk_analysis()
-
     return {
         "message": "Manual analysis completed",
         "risky_count": count
