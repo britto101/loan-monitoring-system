@@ -65,14 +65,13 @@ def safe_merge(left_df, right_df, left_key, right_key):
 
 def should_run_job():
     """
-    Checks if the current time is within the window (15:45 - 15:49) 
+    Checks if the current time is within the window (08:00 - 08:05)
     and verifies if it has already run today.
     """
     ist = timezone("Asia/Kolkata")
     now = datetime.now(ist)
-    
-    # Target Window: 15:45 (3:45 PM IST) to 15:49
-    if now.hour == 15 and 40 <= now.minute <= 45:
+    # Target Window: 08:00 AM to 08:05 AM IST
+    if now.hour == 8 and 0 <= now.minute <= 5:
         today = now.strftime("%Y-%m-%d")
 
         # Check if we already succeeded today
@@ -195,3 +194,4 @@ def get_master(query: AgreementQuery):
 @app.get("/")
 def home():
     return {"service": "Loan Risk Monitoring API", "status": "running"}
+
