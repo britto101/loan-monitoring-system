@@ -36,7 +36,14 @@ employee = pd.read_csv(os.path.join(BASE_DIR, "employee_details.csv"))
 bounce = pd.read_csv(os.path.join(BASE_DIR, "bounce_details.csv"))
 payment = pd.read_csv(os.path.join(BASE_DIR, "payment_details.csv"))
 
+# Normalize column names (VERY IMPORTANT FIX)
+for df in [agreement, product, dealer, employee, bounce, payment]:
+    df.columns = df.columns.str.lower().str.strip()
+
 print("✓ CSV files loaded")
+print("Agreement columns:", agreement.columns)
+print("Bounce columns:", bounce.columns)
+print("Payment columns:", payment.columns)
 
 # =========================
 # REQUEST MODEL
@@ -68,6 +75,9 @@ def safe_merge(left_df, right_df, left_key, right_key):
 @app.post("/get_master")
 def get_master(query: AgreementQuery):
 
+    if "agreement_no" not in agreement.columns:
+        return {"error": "agreement_no column missing in agreement_details"}
+
     a = agreement[agreement["agreement_no"] == query.agreement_no]
 
     if a.empty:
@@ -91,6 +101,9 @@ def get_master(query: AgreementQuery):
 @app.post("/get_bounce")
 def get_bounce(query: AgreementQuery):
 
+    if "agreement_no" not in bounce.columns:
+        return {"error": "agreement_no column missing in bounce_details"}
+
     count = len(bounce[bounce["agreement_no"] == query.agreement_no])
 
     return {
@@ -104,6 +117,9 @@ def get_bounce(query: AgreementQuery):
 
 @app.post("/get_dpd")
 def get_dpd(query: AgreementQuery):
+
+    if "agreement_no" not in payment.columns:
+        return {"error": "agreement_no column missing in payment_details"}
 
     p = payment[payment["agreement_no"] == query.agreement_no]
 
@@ -183,22 +199,29 @@ def run_risk_analysis():
 
     results = []
 
-    for idx, ag in enumerate(agreement["agreement_no"], 1):
+    if "agreement_no" not in agreement.columns:
+        return {"error": "agreement_no column missing in agreement_details"}
 
-        bounce_count = len(bounce[bounce["agreement_no"] == ag])
+    for ag in agreement["agreement_no"]:
 
-        p = payment[payment["agreement_no"] == ag]
+        bounce_count = 0
+        dpd = 0
 
-        if p.empty:
-            dpd = 0
-        else:
+        if "agreement_no" in bounce.columns:
+            bounce_count = len(bounce[bounce["agreement_no"] == ag])
 
-            row = p.iloc[0]
+        if "agreement_no" in payment.columns:
 
-            due = pd.to_datetime(row["due_date"])
-            paid = pd.to_datetime(row["payment_date"])
+            p = payment[payment["agreement_no"] == ag]
 
-            dpd = (paid - due).days
+            if not p.empty:
+
+                row = p.iloc[0]
+
+                due = pd.to_datetime(row["due_date"])
+                paid = pd.to_datetime(row["payment_date"])
+
+                dpd = (paid - due).days
 
         if dpd > 10 or bounce_count >= 2:
 
@@ -274,5 +297,4 @@ def home():
     return {
         "service": "Loan Risk Monitoring API",
         "status": "running"
-
     }
