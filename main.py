@@ -8,6 +8,11 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
+from apscheduler.schedulers.background import BackgroundScheduler
+
+# =========================
+# FASTAPI APP
+# =========================
 
 app = FastAPI(title="Loan Risk Monitoring API")
 
@@ -22,32 +27,23 @@ EMAIL_PASS = os.getenv("EMAIL_PASS")
 EMAIL_TO = os.getenv("EMAIL_TO")
 
 # =========================
-# NORMALIZE COLUMN NAMES
-# =========================
-
-def normalize_columns(df):
-    df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
-    return df
-
-# =========================
 # SAFE CSV LOADER
 # =========================
 
-def load_csv(file):
+def load_csv(filename):
 
-    path = os.path.join(BASE_DIR, file)
+    path = os.path.join(BASE_DIR, filename)
 
     if not os.path.exists(path):
-        print(f"{file} not found")
+        print(f"{filename} not found")
         return pd.DataFrame()
 
     df = pd.read_csv(path)
-    df = normalize_columns(df)
-
+    df.columns = df.columns.str.strip().str.lower()
     return df
 
 # =========================
-# LOAD DATA
+# LOAD CSV FILES
 # =========================
 
 agreement = load_csv("agreement_details.csv")
@@ -83,11 +79,12 @@ def safe_merge(left_df, right_df, left_key, right_key):
     )
 
 # =========================
-# ROOT
+# ROOT API
 # =========================
 
 @app.get("/")
 def home():
+
     return {
         "service": "Loan Risk Monitoring API",
         "status": "running"
@@ -99,6 +96,7 @@ def home():
 
 @app.get("/health")
 def health():
+
     return {"status": "ok"}
 
 # =========================
@@ -178,10 +176,10 @@ def get_dpd(query: AgreementQuery):
 # EMAIL FUNCTION
 # =========================
 
-def send_email(body, file_path=None):
+def send_via_gmail(body, csv_path=None):
 
     if not EMAIL_USER or not EMAIL_PASS or not EMAIL_TO:
-        print("Email credentials missing")
+        print("Email credentials not configured")
         return
 
     msg = MIMEMultipart()
@@ -192,9 +190,9 @@ def send_email(body, file_path=None):
 
     msg.attach(MIMEText(body, "plain"))
 
-    if file_path and os.path.exists(file_path):
+    if csv_path and os.path.exists(csv_path):
 
-        with open(file_path, "rb") as f:
+        with open(csv_path, "rb") as f:
 
             part = MIMEBase("application", "octet-stream")
             part.set_payload(f.read())
@@ -203,7 +201,7 @@ def send_email(body, file_path=None):
 
             part.add_header(
                 "Content-Disposition",
-                f"attachment; filename={os.path.basename(file_path)}"
+                f"attachment; filename={os.path.basename(csv_path)}"
             )
 
             msg.attach(part)
@@ -228,7 +226,7 @@ def send_email(body, file_path=None):
 
 def run_risk_analysis():
 
-    print("Running risk analysis...")
+    print("Running Risk Analysis...")
 
     results = []
 
@@ -237,31 +235,25 @@ def run_risk_analysis():
 
     for ag in agreement["agreement_no"]:
 
-        # bounce
+        bounce_count = 0
+        dpd = 0
+
         if "agreement_no" in bounce.columns:
             bounce_count = len(bounce[bounce["agreement_no"] == ag])
-        else:
-            bounce_count = 0
 
-        # payment
         if "agreement_no" in payment.columns:
+
             p = payment[payment["agreement_no"] == ag]
-        else:
-            p = pd.DataFrame()
 
-        if p.empty:
-            dpd = 0
-        else:
+            if not p.empty:
 
-            row = p.iloc[0]
+                row = p.iloc[0]
 
-            due = pd.to_datetime(row.get("due_date"), errors="coerce")
-            paid = pd.to_datetime(row.get("payment_date"), errors="coerce")
+                due = pd.to_datetime(row.get("due_date"), errors="coerce")
+                paid = pd.to_datetime(row.get("payment_date"), errors="coerce")
 
-            if pd.isna(due) or pd.isna(paid):
-                dpd = 0
-            else:
-                dpd = (paid - due).days
+                if not pd.isna(due) and not pd.isna(paid):
+                    dpd = (paid - due).days
 
         if dpd > 10 or bounce_count >= 2:
 
@@ -280,8 +272,6 @@ def run_risk_analysis():
                 "Action": action
             })
 
-    print("Risky agreements:", len(results))
-
     output_path = os.path.join(BASE_DIR, "daily_risk_output.csv")
 
     if results:
@@ -289,23 +279,14 @@ def run_risk_analysis():
         df = pd.DataFrame(results)
         df.to_csv(output_path, index=False)
 
-        body = f"""
-Daily Risk Report
+        body = f"""Daily Risk Report
+
+Date: {pd.Timestamp.now()}
 
 Total Risky Agreements: {len(results)}
 """
 
-        for r in results:
-
-            body += f"""
-Agreement: {r['agreement_no']}
-DPD: {r['DPD']}
-Bounce: {r['Bounce']}
-Risk: {r['Risk']}
-Action: {r['Action']}
-"""
-
-        send_email(body, output_path)
+        send_via_gmail(body, output_path)
 
     return {"risky_agreements": len(results)}
 
@@ -314,13 +295,30 @@ Action: {r['Action']}
 # =========================
 
 @app.get("/run-risk")
-def run_risk():
-    result = run_risk_analysis()
-    return {"message": "Risk analysis completed", "result": result}
+def trigger_risk():
 
-# alternative route (avoid 404 confusion)
-
-@app.get("/run_risk")
-def run_risk_alt():
     result = run_risk_analysis()
-    return {"message": "Risk analysis completed", "result": result}
+
+    return {
+        "message": "Risk analysis completed",
+        "result": result
+    }
+
+# =========================
+# SCHEDULER (AUTO RUN 11:50 AM)
+# =========================
+
+scheduler = BackgroundScheduler()
+
+def scheduled_risk_job():
+    print("Scheduled job running (11:50 AM)")
+    run_risk_analysis()
+
+scheduler.add_job(
+    scheduled_risk_job,
+    'cron',
+    hour=11,
+    minute=50
+)
+
+scheduler.start()
