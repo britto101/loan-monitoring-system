@@ -3,4 +3,5 @@ uvicorn
 pandas
 pydantic
 requests
+pytz
 apscheduler
