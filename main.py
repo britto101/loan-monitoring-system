@@ -9,10 +9,6 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 
-# =========================
-# FASTAPI APP
-# =========================
-
 app = FastAPI(title="Loan Risk Monitoring API")
 
 # =========================
@@ -26,7 +22,7 @@ EMAIL_PASS = os.getenv("EMAIL_PASS")
 EMAIL_TO = os.getenv("EMAIL_TO")
 
 # =========================
-# NORMALIZE COLUMNS
+# NORMALIZE COLUMN NAMES
 # =========================
 
 def normalize_columns(df):
@@ -38,10 +34,11 @@ def normalize_columns(df):
 # =========================
 
 def load_csv(file):
+
     path = os.path.join(BASE_DIR, file)
 
     if not os.path.exists(path):
-        print(f"⚠ {file} not found")
+        print(f"{file} not found")
         return pd.DataFrame()
 
     df = pd.read_csv(path)
@@ -50,7 +47,7 @@ def load_csv(file):
     return df
 
 # =========================
-# LOAD CSV FILES
+# LOAD DATA
 # =========================
 
 agreement = load_csv("agreement_details.csv")
@@ -60,7 +57,7 @@ employee = load_csv("employee_details.csv")
 bounce = load_csv("bounce_details.csv")
 payment = load_csv("payment_details.csv")
 
-print("✓ CSV files loaded")
+print("CSV files loaded")
 
 # =========================
 # REQUEST MODEL
@@ -84,6 +81,25 @@ def safe_merge(left_df, right_df, left_key, right_key):
         right_on=right_key,
         how="left"
     )
+
+# =========================
+# ROOT
+# =========================
+
+@app.get("/")
+def home():
+    return {
+        "service": "Loan Risk Monitoring API",
+        "status": "running"
+    }
+
+# =========================
+# HEALTH CHECK
+# =========================
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 # =========================
 # MASTER API
@@ -162,10 +178,10 @@ def get_dpd(query: AgreementQuery):
 # EMAIL FUNCTION
 # =========================
 
-def send_via_gmail(body, csv_path=None):
+def send_email(body, file_path=None):
 
     if not EMAIL_USER or not EMAIL_PASS or not EMAIL_TO:
-        print("⚠ Email credentials missing")
+        print("Email credentials missing")
         return
 
     msg = MIMEMultipart()
@@ -176,9 +192,9 @@ def send_via_gmail(body, csv_path=None):
 
     msg.attach(MIMEText(body, "plain"))
 
-    if csv_path and os.path.exists(csv_path):
+    if file_path and os.path.exists(file_path):
 
-        with open(csv_path, "rb") as f:
+        with open(file_path, "rb") as f:
 
             part = MIMEBase("application", "octet-stream")
             part.set_payload(f.read())
@@ -187,7 +203,7 @@ def send_via_gmail(body, csv_path=None):
 
             part.add_header(
                 "Content-Disposition",
-                f"attachment; filename={os.path.basename(csv_path)}"
+                f"attachment; filename={os.path.basename(file_path)}"
             )
 
             msg.attach(part)
@@ -200,7 +216,7 @@ def send_via_gmail(body, csv_path=None):
             server.login(EMAIL_USER, EMAIL_PASS)
             server.send_message(msg)
 
-        print("✓ Email sent successfully")
+        print("Email sent")
 
     except Exception as e:
 
@@ -212,7 +228,7 @@ def send_via_gmail(body, csv_path=None):
 
 def run_risk_analysis():
 
-    print("Running Risk Analysis...")
+    print("Running risk analysis...")
 
     results = []
 
@@ -221,13 +237,13 @@ def run_risk_analysis():
 
     for ag in agreement["agreement_no"]:
 
-        # Bounce Count
+        # bounce
         if "agreement_no" in bounce.columns:
             bounce_count = len(bounce[bounce["agreement_no"] == ag])
         else:
             bounce_count = 0
 
-        # Payment
+        # payment
         if "agreement_no" in payment.columns:
             p = payment[payment["agreement_no"] == ag]
         else:
@@ -273,9 +289,8 @@ def run_risk_analysis():
         df = pd.DataFrame(results)
         df.to_csv(output_path, index=False)
 
-        body = f"""Daily Risk Report
-
-Date: {pd.Timestamp.now()}
+        body = f"""
+Daily Risk Report
 
 Total Risky Agreements: {len(results)}
 """
@@ -283,17 +298,29 @@ Total Risky Agreements: {len(results)}
         for r in results:
 
             body += f"""
-Agreement No: {r['agreement_no']}
+Agreement: {r['agreement_no']}
 DPD: {r['DPD']}
-Bounce Count: {r['Bounce']}
-Risk Level: {r['Risk']}
+Bounce: {r['Bounce']}
+Risk: {r['Risk']}
 Action: {r['Action']}
 """
 
-        send_via_gmail(body, output_path)
+        send_email(body, output_path)
 
-    return {
-        "risky_agreements": len(results)
-    }
+    return {"risky_agreements": len(results)}
 
-# ==
+# =========================
+# RUN RISK API
+# =========================
+
+@app.get("/run-risk")
+def run_risk():
+    result = run_risk_analysis()
+    return {"message": "Risk analysis completed", "result": result}
+
+# alternative route (avoid 404 confusion)
+
+@app.get("/run_risk")
+def run_risk_alt():
+    result = run_risk_analysis()
+    return {"message": "Risk analysis completed", "result": result}
