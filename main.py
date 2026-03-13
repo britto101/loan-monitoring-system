@@ -1,13 +1,14 @@
 import pandas as pd
 import os
-import smtplib
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email import encoders
+
+# SENDGRID IMPORT
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition
+
+import base64
 
 # NEW IMPORTS FOR AUTOMATION
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -27,8 +28,8 @@ app = FastAPI(title="Loan Risk Monitoring API")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 EMAIL_USER = os.getenv("EMAIL_USER")
-EMAIL_PASS = os.getenv("EMAIL_PASS")
 EMAIL_TO = os.getenv("EMAIL_TO")
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
 
 # =========================
 # LOAD CSV FILES
@@ -135,51 +136,46 @@ def get_dpd(query: AgreementQuery):
     }
 
 # =========================
-# EMAIL FUNCTION
+# EMAIL FUNCTION (SENDGRID)
 # =========================
 
-def send_via_gmail(body, csv_path=None):
+def send_via_sendgrid(body, csv_path=None):
 
-    if not EMAIL_USER or not EMAIL_PASS or not EMAIL_TO:
-        print("Email credentials not configured")
+    if not SENDGRID_API_KEY:
+        print("SendGrid API key not configured")
         return
 
-    msg = MIMEMultipart()
-
-    msg["From"] = EMAIL_USER
-    msg["To"] = EMAIL_TO
-    msg["Subject"] = "Daily Risk Alert"
-
-    msg.attach(MIMEText(body, "plain"))
+    message = Mail(
+        from_email=EMAIL_USER,
+        to_emails=EMAIL_TO,
+        subject="Daily Risk Alert",
+        plain_text_content=body
+    )
 
     if csv_path and os.path.exists(csv_path):
 
         with open(csv_path, "rb") as f:
 
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(f.read())
+            encoded = base64.b64encode(f.read()).decode()
 
-            encoders.encode_base64(part)
-
-            part.add_header(
-                "Content-Disposition",
-                f"attachment; filename={os.path.basename(csv_path)}"
+            attachment = Attachment(
+                FileContent(encoded),
+                FileName(os.path.basename(csv_path)),
+                FileType("text/csv"),
+                Disposition("attachment")
             )
 
-            msg.attach(part)
+            message.attachment = attachment
 
     try:
 
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        sg.send(message)
 
-            server.starttls()
-            server.login(EMAIL_USER, EMAIL_PASS)
-            server.send_message(msg)
-
-        print("✓ Email sent")
+        print("✓ Email sent via SendGrid")
 
     except Exception as e:
-        print("Email error:", e)
+        print("SendGrid error:", e)
 
 # =========================
 # RISK ENGINE
@@ -194,7 +190,6 @@ def run_risk_analysis():
     for ag in agreement["agreement_no"]:
 
         bounce_count = len(bounce[bounce["agreement_no"] == ag])
-
         p = payment[payment["agreement_no"] == ag]
 
         dpd = 0
@@ -210,12 +205,8 @@ def run_risk_analysis():
 
         if dpd > 10 or bounce_count >= 2:
 
-            if dpd > 30:
-                risk = "HIGH RISK"
-                action = "Legal Notice Triggered"
-            else:
-                risk = "MEDIUM RISK"
-                action = "Reminder Mail Triggered"
+            risk = "HIGH RISK" if dpd > 30 else "MEDIUM RISK"
+            action = "Legal Notice Triggered" if dpd > 30 else "Reminder Mail Triggered"
 
             results.append({
                 "agreement_no": ag,
@@ -239,7 +230,7 @@ Date: {pd.Timestamp.now()}
 Total Risky Agreements: {len(results)}
 """
 
-        send_via_gmail(body, output_path)
+        send_via_sendgrid(body, output_path)
 
     return len(results)
 
@@ -252,7 +243,7 @@ ist = timezone("Asia/Kolkata")
 
 scheduler.add_job(
     run_risk_analysis,
-    CronTrigger(hour=10, minute=0, timezone=ist),  # Runs daily 10 AM IST
+    CronTrigger(hour=10, minute=0, timezone=ist),
     id="daily_risk_job",
     replace_existing=True
 )
