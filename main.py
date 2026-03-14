@@ -4,194 +4,110 @@ import base64
 from datetime import datetime
 from pytz import timezone
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-
-# SENDGRID IMPORT
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition
 
-# =========================
-# FASTAPI APP
-# =========================
+app = FastAPI(title="Loan Risk Monitor")
 
-app = FastAPI(title="Loan Risk Monitoring API")
-
-# =========================
-# CONFIG & PATHS
-# =========================
-
+# CONFIG - Render uses environment variables for security
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LAST_RUN_FILE = os.path.join(BASE_DIR, "last_run.txt")
-
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
 EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_TO = os.getenv("EMAIL_TO")
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
 
-# =========================
-# LOAD CSV FILES
-# =========================
-
-try:
-    agreement = pd.read_csv(os.path.join(BASE_DIR, "agreement_details.csv"))
-    product = pd.read_csv(os.path.join(BASE_DIR, "product_details.csv"))
-    dealer = pd.read_csv(os.path.join(BASE_DIR, "dealer_details.csv"))
-    employee = pd.read_csv(os.path.join(BASE_DIR, "employee_details.csv"))
-    bounce = pd.read_csv(os.path.join(BASE_DIR, "bounce_details.csv"))
-    payment = pd.read_csv(os.path.join(BASE_DIR, "payment_details.csv"))
-
-    # Normalize column names
-    for df in [agreement, product, dealer, employee, bounce, payment]:
-        df.columns = df.columns.str.lower().str.strip()
-    print("✓ CSV files loaded")
-except Exception as e:
-    print(f"Error loading CSVs: {e}")
-
-# =========================
-# REQUEST MODEL & HELPERS
-# =========================
-
-class AgreementQuery(BaseModel):
-    agreement_no: int
-
-def safe_merge(left_df, right_df, left_key, right_key):
-    if left_key not in left_df.columns or right_key not in right_df.columns:
-        return left_df
-    return left_df.merge(right_df, left_on=left_key, right_on=right_key, how="left")
-
-# =========================
-# CORE LOGIC: SHOULD JOB RUN?
-# =========================
-
-def should_run_job():
-    """
-    Checks if the current time is within the window (08:00 - 08:05)
-    and verifies if it has already run today.
-    """
+def should_run_now():
+    """Checks if it is the 8:00 AM IST window and if we haven't run today."""
     ist = timezone("Asia/Kolkata")
     now = datetime.now(ist)
-    # Target Window: 08:00 AM to 08:05 AM IST
-    if now.hour == 8 and 0 <= now.minute <= 5:
+    
+    # Target: 08:00 AM to 08:15 AM IST
+    # We allow a 15-min window in case Render takes a moment to wake up
+    if now.hour == 8 and 0 <= now.minute <= 15:
         today = now.strftime("%Y-%m-%d")
-
-        # Check if we already succeeded today
+        
+        # Check if the file exists and has today's date
         if os.path.exists(LAST_RUN_FILE):
             with open(LAST_RUN_FILE, "r") as f:
-                last_date = f.read().strip()
-                if last_date == today:
-                    return False # Already ran today
-
-        # Write today's date to file to mark success
+                if f.read().strip() == today:
+                    return False # Already sent today
+        
+        # Mark as run by writing today's date
         with open(LAST_RUN_FILE, "w") as f:
             f.write(today)
         return True
-
     return False
 
-# =========================
-# EMAIL & RISK ENGINE
-# =========================
+def run_risk_analysis():
+    """The core logic to process CSVs and send the email."""
+    try:
+        # Load the CSV files from the repository folder
+        agreement = pd.read_csv(os.path.join(BASE_DIR, "agreement_details.csv"))
+        bounce = pd.read_csv(os.path.join(BASE_DIR, "bounce_details.csv"))
+        payment = pd.read_csv(os.path.join(BASE_DIR, "payment_details.csv"))
+        
+        results = []
+        for ag in agreement["agreement_no"]:
+            b_count = len(bounce[bounce["agreement_no"] == ag])
+            p = payment[payment["agreement_no"] == ag]
+            dpd = 0
+            
+            if not p.empty:
+                # Calculate Days Past Due
+                due = pd.to_datetime(p.iloc[0]["due_date"])
+                paid = pd.to_datetime(p.iloc[0]["payment_date"])
+                dpd = (paid - due).days
 
-def send_via_sendgrid(body, csv_path=None):
-    if not SENDGRID_API_KEY:
-        print("SendGrid API key not configured")
-        return
+            # Logic: 10+ days late OR 2+ bounces
+            if dpd > 10 or b_count >= 2:
+                results.append({
+                    "agreement_no": ag, 
+                    "DPD": dpd, 
+                    "Bounce": b_count, 
+                    "Risk": "HIGH" if dpd > 30 else "MEDIUM"
+                })
 
-    message = Mail(
-        from_email=EMAIL_USER,
-        to_emails=EMAIL_TO,
-        subject="Daily Risk Alert (Automated)",
-        plain_text_content=body
-    )
+        if not results:
+            return 0
 
-    if csv_path and os.path.exists(csv_path):
+        # Create the report CSV
+        df = pd.DataFrame(results)
+        csv_path = os.path.join(BASE_DIR, "daily_report.csv")
+        df.to_csv(csv_path, index=False)
+
+        # Prepare SendGrid Email
+        message = Mail(
+            from_email=EMAIL_USER,
+            to_emails=EMAIL_TO,
+            subject=f"Risk Report - {datetime.now().strftime('%Y-%m-%d')}",
+            plain_text_content=f"Analysis complete. Found {len(results)} risky agreements."
+        )
+
         with open(csv_path, "rb") as f:
             encoded = base64.b64encode(f.read()).decode()
-            attachment = Attachment(
+            message.attachment = Attachment(
                 FileContent(encoded),
-                FileName(os.path.basename(csv_path)),
+                FileName("risk_report.csv"),
                 FileType("text/csv"),
                 Disposition("attachment")
             )
-            message.attachment = attachment
-
-    try:
+        
         sg = SendGridAPIClient(SENDGRID_API_KEY)
         sg.send(message)
-        print("✓ Email sent via SendGrid")
-    except Exception as e:
-        print("SendGrid error:", e)
-
-def run_risk_analysis():
-    print("\nRunning Risk Analysis...")
-    results = []
-
-    for ag in agreement["agreement_no"]:
-        bounce_count = len(bounce[bounce["agreement_no"] == ag])
-        p = payment[payment["agreement_no"] == ag]
-        dpd = 0
-
-        if not p.empty:
-            row = p.iloc[0]
-            due = pd.to_datetime(row["due_date"])
-            paid = pd.to_datetime(row["payment_date"])
-            dpd = (paid - due).days
-
-        if dpd > 10 or bounce_count >= 2:
-            risk = "HIGH RISK" if dpd > 30 else "MEDIUM RISK"
-            action = "Legal Notice Triggered" if dpd > 30 else "Reminder Mail Triggered"
-            results.append({
-                "agreement_no": ag,
-                "DPD": dpd,
-                "Bounce": bounce_count,
-                "Risk": risk,
-                "Action": action
-            })
-
-    output_path = os.path.join(BASE_DIR, "daily_risk_output.csv")
-    if results:
-        df = pd.DataFrame(results)
-        df.to_csv(output_path, index=False)
-        body = f"Daily Risk Report\nDate: {pd.Timestamp.now()}\nTotal Risky Agreements: {len(results)}"
-        send_via_sendgrid(body, output_path)
+        return len(results)
     
-    return len(results)
-
-# =========================
-# ENDPOINTS
-# =========================
-
-@app.get("/run-risk")
-def trigger_risk():
-    """
-    This endpoint is called by UptimeRobot every 5 mins.
-    It checks the time and runs the analysis only in the target window.
-    """
-    if should_run_job():
-        count = run_risk_analysis()
-        return {
-            "status": "success",
-            "message": "Risk analysis executed and email sent.",
-            "risky_agreements": count
-        }
-
-    return {
-        "status": "idle",
-        "message": "Not within scheduling window or already completed for today."
-    }
-
-@app.post("/get_master")
-def get_master(query: AgreementQuery):
-    a = agreement[agreement["agreement_no"] == query.agreement_no]
-    if a.empty:
-        return JSONResponse(status_code=404, content={"error": "Agreement not found"})
-    m = a.copy()
-    m = safe_merge(m, product, "product_id", "product_id")
-    m = safe_merge(m, dealer, "dealer_id", "dealer_id")
-    m = safe_merge(m, employee, "employee_id", "employee_id")
-    return m.to_dict(orient="records")[0]
+    except Exception as e:
+        print(f"Error during analysis: {e}")
+        return 0
 
 @app.get("/")
-def home():
-    return {"service": "Loan Risk Monitoring API", "status": "running"}
-
+def health_check():
+    """
+    UptimeRobot hits this. 
+    It keeps the app awake and triggers the logic if the time is right.
+    """
+    if should_run_now():
+        count = run_risk_analysis()
+        return {"status": "success", "message": "Risk report sent", "count": count}
+    
+    return {"status": "active", "message": "Monitoring... Waiting for 08:00 AM IST"}
