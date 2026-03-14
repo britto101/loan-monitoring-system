@@ -7,3 +7,8 @@ pytz
 apscheduler
 sendgrid
 
+fastapi
+uvicorn
+pandas
+sendgrid
+pytz
