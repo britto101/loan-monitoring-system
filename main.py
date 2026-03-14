@@ -19,7 +19,7 @@ EMAIL_TO = os.getenv("EMAIL_TO")
 def should_run_now():
     ist = timezone("Asia/Kolkata")
     now = datetime.now(ist)
-    if now.hour == 11 and 0 <= now.minute <= 20:
+    if now.hour == 11 and 15 <= now.minute <= 20:
         today = now.strftime("%Y-%m-%d")
         if os.path.exists(LAST_RUN_FILE):
             with open(LAST_RUN_FILE, "r") as f:
