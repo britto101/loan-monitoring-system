@@ -9,39 +9,43 @@ from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileT
 
 app = FastAPI(title="Loan Risk Monitor")
 
-# CONFIG - Render uses environment variables for security
+# CONFIG
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Note: On Render, files are ephemeral. last_run.txt works as long as the instance is alive.
 LAST_RUN_FILE = os.path.join(BASE_DIR, "last_run.txt")
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
 EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_TO = os.getenv("EMAIL_TO")
 
 def should_run_now():
-    """Checks if it is the 8:00 AM IST window and if we haven't run today."""
+    """
+    Ensures the job runs exactly once between 8:00 AM and 8:20 AM IST.
+    A 20-minute window guarantees a 5-minute pinger will land inside it.
+    """
     ist = timezone("Asia/Kolkata")
     now = datetime.now(ist)
     
-    # Target: 08:00 AM to 08:15 AM IST
-    # We allow a 15-min window in case Render takes a moment to wake up
-    if now.hour == 8 and 0 <= now.minute <= 15:
+    # Check if we are in the target hour and window
+    # If Uptime pings at 8:01, 8:06, 8:11, or 8:14, it will trigger.
+    if now.hour == 8 and 0 <= now.minute <= 20:
         today = now.strftime("%Y-%m-%d")
         
-        # Check if the file exists and has today's date
+        # Prevent double-sending
         if os.path.exists(LAST_RUN_FILE):
             with open(LAST_RUN_FILE, "r") as f:
                 if f.read().strip() == today:
-                    return False # Already sent today
+                    return False 
         
-        # Mark as run by writing today's date
+        # Write success flag
         with open(LAST_RUN_FILE, "w") as f:
             f.write(today)
         return True
+        
     return False
 
 def run_risk_analysis():
-    """The core logic to process CSVs and send the email."""
     try:
-        # Load the CSV files from the repository folder
+        # Load CSVs
         agreement = pd.read_csv(os.path.join(BASE_DIR, "agreement_details.csv"))
         bounce = pd.read_csv(os.path.join(BASE_DIR, "bounce_details.csv"))
         payment = pd.read_csv(os.path.join(BASE_DIR, "payment_details.csv"))
@@ -51,14 +55,11 @@ def run_risk_analysis():
             b_count = len(bounce[bounce["agreement_no"] == ag])
             p = payment[payment["agreement_no"] == ag]
             dpd = 0
-            
             if not p.empty:
-                # Calculate Days Past Due
                 due = pd.to_datetime(p.iloc[0]["due_date"])
                 paid = pd.to_datetime(p.iloc[0]["payment_date"])
                 dpd = (paid - due).days
 
-            # Logic: 10+ days late OR 2+ bounces
             if dpd > 10 or b_count >= 2:
                 results.append({
                     "agreement_no": ag, 
@@ -70,17 +71,15 @@ def run_risk_analysis():
         if not results:
             return 0
 
-        # Create the report CSV
         df = pd.DataFrame(results)
         csv_path = os.path.join(BASE_DIR, "daily_report.csv")
         df.to_csv(csv_path, index=False)
 
-        # Prepare SendGrid Email
         message = Mail(
             from_email=EMAIL_USER,
             to_emails=EMAIL_TO,
-            subject=f"Risk Report - {datetime.now().strftime('%Y-%m-%d')}",
-            plain_text_content=f"Analysis complete. Found {len(results)} risky agreements."
+            subject=f"Loan Risk Report: {datetime.now(timezone('Asia/Kolkata')).strftime('%d-%m-%Y')}",
+            plain_text_content=f"Found {len(results)} risky agreements. Please find the attached report."
         )
 
         with open(csv_path, "rb") as f:
@@ -97,17 +96,14 @@ def run_risk_analysis():
         return len(results)
     
     except Exception as e:
-        print(f"Error during analysis: {e}")
+        print(f"Error: {e}")
         return 0
 
 @app.get("/")
-def health_check():
-    """
-    UptimeRobot hits this. 
-    It keeps the app awake and triggers the logic if the time is right.
-    """
+def monitor():
+    """Endpoint for UptimeRobot"""
     if should_run_now():
         count = run_risk_analysis()
-        return {"status": "success", "message": "Risk report sent", "count": count}
+        return {"status": "executed", "records_found": count}
     
-    return {"status": "active", "message": "Monitoring... Waiting for 08:00 AM IST"}
+    return {"status": "idle", "msg": "Waiting for 8:00 AM IST window"}
