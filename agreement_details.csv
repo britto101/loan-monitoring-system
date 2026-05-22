@@ -6,3 +6,4 @@ agreement_no,customer_name,product_id,dealer_id,employee_id,emi_amount,status
 1005,sri,105,205,305,20000,ACTIVE
 1006,mani,106,206,306,8000,ACTIVE
 1007,raja,107,207,307,13000,ACTIVE
+1008,athul,108,208,308,14000,ACTIVE
